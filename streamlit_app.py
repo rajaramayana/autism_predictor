@@ -2,6 +2,8 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+plt.rcParams['mathtext.default'] = 'regular'
+plt.rcParams['text.usetex'] = False
 import seaborn as sns
 import pickle
 import os
@@ -23,6 +25,11 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticD
 from sklearn.neural_network import MLPClassifier
 
 from imblearn.over_sampling import SMOTE
+import shap
+import lime
+import lime.lime_tabular
+import streamlit.components.v1 as components
+from sklearn.inspection import permutation_importance
 
 # Import TensorFlow only when needed (lazy loading)
 
@@ -42,9 +49,121 @@ page = st.sidebar.radio(
     ["🏠 Home", "🤖 Model Training", "🔮 Make Prediction", "📊 Model Comparison"]
 )
 
+# Module-level constant for pretrained model storage
+PRETRAINED_DIR = "pretrained_models"
+
 # ==========================================
-# UTILITY FUNCTIONS
+# UTILITY & XAI HELPER FUNCTIONS
 # ==========================================
+
+def generate_clinical_narrative(feature_names, input_values, shap_values, base_value, probability, model_name):
+    """Generate human-readable clinical explanation based on SHAP feature attributions"""
+    prob_percent = probability * 100
+    is_positive = probability >= 0.5
+    diagnosis_str = "🔴 High Risk of ASD (Positive)" if is_positive else "🟢 Low Risk of ASD (Negative)"
+    
+    feature_impacts = []
+    for name, val, shap_val in zip(feature_names, input_values, shap_values):
+        feature_impacts.append({
+            'name': name,
+            'value': val,
+            'shap': shap_val,
+            'abs_shap': abs(shap_val)
+        })
+    
+    feature_impacts.sort(key=lambda x: x['abs_shap'], reverse=True)
+    
+    risk_increasing = [f for f in feature_impacts if f['shap'] > 0.005]
+    risk_decreasing = [f for f in feature_impacts if f['shap'] < -0.005]
+    
+    narrative = f"""
+#### 🩺 Clinical Decision Narrative ({model_name})
+
+- **Diagnostic Risk Prediction:** **{diagnosis_str}** with a confidence score of **{prob_percent:.1f}%**.
+- **Population Baseline Risk:** `{base_value * 100:.1f}%` (average baseline probability).
+"""
+    
+    if risk_increasing:
+        narrative += "\n##### ⚠️ Top Risk-Elevating Factors:\n"
+        for item in risk_increasing[:5]:
+            narrative += f"- **{item['name']}** (Score/Value: `{item['value']:.1f}`): Contributed **+{item['shap']*100:.2f}%** toward ASD risk.\n"
+            
+    if risk_decreasing:
+        narrative += "\n##### 🟢 Top Protective / Low-Risk Factors:\n"
+        for item in risk_decreasing[:5]:
+            narrative += f"- **{item['name']}** (Score/Value: `{item['value']:.1f}`): Reduced ASD risk contribution by **{item['shap']*100:.2f}%**.\n"
+            
+    narrative += """
+---
+*SHAP (SHapley Additive exPlanations) computes exact game-theoretic contributions of each clinical parameter relative to expected population baseline values.*
+"""
+    return narrative
+
+def compute_shap_explanation(model, input_scaled, feature_names, X_train_scaled, input_values):
+    """Compute SHAP explanation object, values array, and baseline value"""
+    try:
+        if hasattr(model, "feature_importances_"):
+            explainer = shap.TreeExplainer(model)
+            shap_obj = explainer(input_scaled)
+            if len(shap_obj.shape) == 3:
+                values = shap_obj.values[0, :, 1]
+                base_val = shap_obj.base_values[0, 1]
+            else:
+                values = shap_obj.values[0]
+                base_val = shap_obj.base_values[0]
+        else:
+            bg_sample = shap.sample(X_train_scaled, 40, random_state=42)
+            explainer = shap.KernelExplainer(model.predict_proba, bg_sample)
+            shap_vals = explainer.shap_values(input_scaled)
+            if isinstance(shap_vals, list):
+                values = shap_vals[1][0]
+                base_val = explainer.expected_value[1]
+            elif isinstance(shap_vals, np.ndarray) and len(shap_vals.shape) == 3:
+                values = shap_vals[0, :, 1]
+                base_val = explainer.expected_value[1]
+            else:
+                values = shap_vals[0]
+                base_val = explainer.expected_value
+                
+        if hasattr(base_val, "item"):
+            base_val = float(base_val.item())
+        elif isinstance(base_val, (list, np.ndarray)):
+            base_val = float(base_val[0])
+        else:
+            base_val = float(base_val)
+            
+        explanation = shap.Explanation(
+            values=np.array(values, dtype=float),
+            base_values=base_val,
+            data=np.array(input_values, dtype=float),
+            feature_names=feature_names
+        )
+        return explanation, values, base_val
+    except Exception as e:
+        st.error(f"Error computing SHAP values: {e}")
+        return None, None, None
+
+
+def compute_lime_explanation(model, input_scaled, feature_names, X_train_scaled):
+    """Compute LIME tabular instance explanation"""
+    try:
+        explainer = lime.lime_tabular.LimeTabularExplainer(
+            training_data=X_train_scaled,
+            feature_names=feature_names,
+            class_names=['ASD Negative', 'ASD Positive'],
+            mode='classification',
+            random_state=42
+        )
+        exp = explainer.explain_instance(
+            data_row=input_scaled[0],
+            predict_fn=model.predict_proba,
+            num_features=10
+        )
+        return exp
+    except Exception as e:
+        st.error(f"Error computing LIME explanation: {e}")
+        return None
+
 
 @st.cache_data
 def load_data():
@@ -219,6 +338,7 @@ if page == "🏠 Home":
 # PAGE 2: MODEL TRAINING
 # ==========================================
 elif page == "🤖 Model Training":
+
     st.subheader("🤖 Train Models")
     
     try:
@@ -242,40 +362,131 @@ elif page == "🤖 Model Training":
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        if st.button("🚀 Train All Models", key="train_button"):
-            with st.spinner("Training models... This may take a moment..."):
-                # Train classical models
-                results_df, roc_data, trained_models = train_models(
-                    X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
-                )
-                
-                # Train ANN
-                ann, ann_metrics, ann_roc, history = train_ann(
-                    X_train_scaled, X_test_scaled, y_train, y_test
-                )
-                
-                # Add ANN to results
-                results_df.loc[len(results_df)] = [
-                    "ANN", ann_metrics[0], ann_metrics[1], ann_metrics[2],
-                    ann_metrics[3], ann_metrics[4], ann_metrics[5],
-                    ann_metrics[6], ann_metrics[7], ann_metrics[8]
-                ]
-                
-                roc_data.append(("ANN", ann_roc[0], ann_roc[1], ann_roc[2]))
-                
-                st.success("✅ Training completed!")
-                
-                # Store in session state
-                st.session_state.results_df = results_df
-                st.session_state.roc_data = roc_data
-                st.session_state.trained_models = trained_models
-                st.session_state.ann = ann
-                st.session_state.scaler = scaler
-                st.session_state.le_dict = le_dict
-                st.session_state.feature_names = X.columns.tolist()
-                st.session_state.numeric_cols = numeric_cols
-                st.session_state.categorical_cols = categorical_cols
-                st.session_state.df_encoded = df_encoded
+        # ---- Mode selection: Train fresh or Load pretrained ----
+        pretrained_exists = os.path.isdir(PRETRAINED_DIR) and os.path.isfile(
+            os.path.join(PRETRAINED_DIR, "scaler.pkl")
+        )
+        
+        if pretrained_exists:
+            train_mode = st.radio(
+                "🔧 Model Mode:",
+                ["🚀 Train New Models", "📂 Load Pretrained Models"],
+                horizontal=True,
+                key="train_mode_radio"
+            )
+        else:
+            train_mode = "🚀 Train New Models"
+            st.info("💡 No saved models found yet. Train and save models to enable loading them later.")
+        
+        st.markdown("---")
+        
+        if train_mode == "📂 Load Pretrained Models":
+            # ---- LOAD PRETRAINED ----
+            st.subheader("📂 Load Previously Saved Models")
+            
+            saved_files = [f for f in os.listdir(PRETRAINED_DIR) if f.endswith(".pkl")]
+            model_names_saved = [f.replace(".pkl", "") for f in saved_files if f != "scaler.pkl"]
+            
+            st.write(f"**Found {len(model_names_saved)} saved model(s):**")
+            st.write(", ".join(f"`{n}`" for n in model_names_saved))
+            
+            if st.button("📂 Load Pretrained Models", key="load_pretrained_button"):
+                with st.spinner("Loading saved models from disk..."):
+                    try:
+                        # Load scaler
+                        with open(os.path.join(PRETRAINED_DIR, "scaler.pkl"), "rb") as f:
+                            saved_scaler = pickle.load(f)
+                        
+                        # Load all model .pkl files, restoring original names
+                        loaded_models = {}
+                        for fname in saved_files:
+                            if fname in ("scaler.pkl", "metadata.pkl"):
+                                continue
+                            # Reverse the safe_name transform: underscores back to spaces
+                            original_name = fname.replace(".pkl", "").replace("_", " ")
+                            with open(os.path.join(PRETRAINED_DIR, fname), "rb") as f:
+                                loaded_models[original_name] = pickle.load(f)
+                        
+                        # Load metadata (results_df, roc_data)
+                        meta_path = os.path.join(PRETRAINED_DIR, "metadata.pkl")
+                        if os.path.isfile(meta_path):
+                            with open(meta_path, "rb") as f:
+                                meta = pickle.load(f)
+                            results_df = meta["results_df"]
+                            roc_data = meta["roc_data"]
+                        else:
+                            st.warning("Metadata file missing. Performance table may not be restored.")
+                            results_df = pd.DataFrame()
+                            roc_data = []
+                        
+                        # Recompute scaled test sets from loaded scaler
+                        ldr_X_test_scaled = saved_scaler.transform(X_test)
+                        ldr_X_train_scaled = saved_scaler.transform(X_train)
+                        
+                        # Store in session state
+                        st.session_state.results_df = results_df
+                        st.session_state.roc_data = roc_data
+                        st.session_state.trained_models = loaded_models
+                        st.session_state.ann = loaded_models.get("ANN")
+                        st.session_state.scaler = saved_scaler
+                        st.session_state.le_dict = le_dict
+                        st.session_state.feature_names = X.columns.tolist()
+                        st.session_state.numeric_cols = numeric_cols
+                        st.session_state.categorical_cols = categorical_cols
+                        st.session_state.df_encoded = df_encoded
+                        st.session_state.X_train = X_train
+                        st.session_state.X_train_scaled = ldr_X_train_scaled
+                        st.session_state.X_test_scaled = ldr_X_test_scaled
+                        st.session_state.y_train = y_train
+                        st.session_state.y_test = y_test
+                        
+                        st.success(f"✅ Successfully loaded {len(loaded_models)} pretrained models!")
+                    
+                    except Exception as load_err:
+                        st.error(f"Error loading pretrained models: {load_err}")
+        
+        else:
+            # ---- TRAIN FRESH ----
+            if st.button("🚀 Train All Models", key="train_button"):
+                with st.spinner("Training models... This may take a moment..."):
+                    # Train classical models
+                    results_df, roc_data, trained_models = train_models(
+                        X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
+                    )
+                    
+                    # Train ANN
+                    ann, ann_metrics, ann_roc, history = train_ann(
+                        X_train_scaled, X_test_scaled, y_train, y_test
+                    )
+                    
+                    # Add ANN to results
+                    results_df.loc[len(results_df)] = [
+                        "ANN", ann_metrics[0], ann_metrics[1], ann_metrics[2],
+                        ann_metrics[3], ann_metrics[4], ann_metrics[5],
+                        ann_metrics[6], ann_metrics[7], ann_metrics[8]
+                    ]
+                    
+                    roc_data.append(("ANN", ann_roc[0], ann_roc[1], ann_roc[2]))
+                    trained_models["ANN"] = ann
+                    
+                    st.success("✅ Training completed!")
+                    
+                    # Store in session state
+                    st.session_state.results_df = results_df
+                    st.session_state.roc_data = roc_data
+                    st.session_state.trained_models = trained_models
+                    st.session_state.ann = ann
+                    st.session_state.scaler = scaler
+                    st.session_state.le_dict = le_dict
+                    st.session_state.feature_names = X.columns.tolist()
+                    st.session_state.numeric_cols = numeric_cols
+                    st.session_state.categorical_cols = categorical_cols
+                    st.session_state.df_encoded = df_encoded
+                    st.session_state.X_train = X_train
+                    st.session_state.X_train_scaled = X_train_scaled
+                    st.session_state.X_test_scaled = X_test_scaled
+                    st.session_state.y_train = y_train
+                    st.session_state.y_test = y_test
         
         # Display results if available
         if 'results_df' in st.session_state:
@@ -285,8 +496,8 @@ elif page == "🤖 Model Training":
             st.dataframe(results_sorted.style.highlight_max(axis=0), use_container_width=True)
             
             # Best model
-            best_model = results_sorted.iloc[0]
-            st.success(f"🏆 Best Model: **{best_model['Model']}** with ROC-AUC: {best_model['ROC-AUC']:.4f}")
+            best_model_row = results_sorted.iloc[0]
+            st.success(f"🏆 Best Model: **{best_model_row['Model']}** with ROC-AUC: {best_model_row['ROC-AUC']:.4f}")
 
             # Overfitting Gap Table
             st.subheader("📊 Overfitting Analysis (Train vs Test Accuracy Gap)")
@@ -308,9 +519,42 @@ elif page == "🤖 Model Training":
             gap_df["Test Accuracy"] = gap_df["Test Accuracy"].map("{:.6f}".format)
             gap_df["Gap"] = gap_df["Gap"].map("{:.6f}".format)
             st.dataframe(gap_df, use_container_width=True)
+            
+            # ---- Save Models to Disk ----
+            st.markdown("---")
+            st.subheader("💾 Save Trained Models")
+            st.write("Save all trained models to disk so they can be loaded next time without retraining.")
+            if st.button("💾 Save All Models to Disk", key="save_models_button"):
+                try:
+                    os.makedirs(PRETRAINED_DIR, exist_ok=True)
+                    
+                    # Save scaler
+                    with open(os.path.join(PRETRAINED_DIR, "scaler.pkl"), "wb") as f:
+                        pickle.dump(st.session_state.scaler, f)
+                    
+                    # Save each model separately
+                    for name, model in st.session_state.trained_models.items():
+                        safe_name = name.replace(" ", "_").replace("(", "").replace(")", "")
+                        with open(os.path.join(PRETRAINED_DIR, f"{safe_name}.pkl"), "wb") as f:
+                            pickle.dump(model, f)
+                    
+                    # Save metadata (results_df & roc_data) — exclude non-picklable objects
+                    meta = {
+                        "results_df": st.session_state.results_df,
+                        "roc_data": st.session_state.roc_data
+                    }
+                    with open(os.path.join(PRETRAINED_DIR, "metadata.pkl"), "wb") as f:
+                        pickle.dump(meta, f)
+                    
+                    n_saved = len(st.session_state.trained_models)
+                    st.success(f"✅ {n_saved} models saved to `{PRETRAINED_DIR}/` folder! You can now use 'Load Pretrained Models' next time.")
+                except Exception as save_err:
+                    st.error(f"Error saving models: {save_err}")
     
     except Exception as e:
         st.error(f"Error during training: {e}")
+
+
 
 # ==========================================
 # PAGE 3: MAKE PREDICTION
@@ -363,18 +607,26 @@ elif page == "🔮 Make Prediction":
                 input_array = np.array(input_values).reshape(1, -1).astype(float)
                 input_scaled = st.session_state.scaler.transform(input_array)
                 
+                st.session_state.last_input_values = input_values
+                st.session_state.last_input_array = input_array
+                st.session_state.last_input_scaled = input_scaled
+                st.session_state.has_prediction = True
+
+            if st.session_state.get("has_prediction", False):
+                input_values = st.session_state.last_input_values
+                input_array = st.session_state.last_input_array
+                input_scaled = st.session_state.last_input_scaled
+                
                 col1, col2 = st.columns(2)
                 
+                results_sorted = st.session_state.results_df.sort_values(by="ROC-AUC", ascending=False)
+                best_classical = results_sorted[results_sorted['Model'] != 'ANN'].iloc[0]
+                best_model = st.session_state.trained_models[best_classical['Model']]
+                prediction = best_model.predict(input_scaled)[0]
+                probability = best_model.predict_proba(input_scaled)[0][1]
+
                 with col1:
                     st.subheader("Classical Model Predictions")
-                    # Get best classical model
-                    results_sorted = st.session_state.results_df.sort_values(by="ROC-AUC", ascending=False)
-                    best_classical = results_sorted[results_sorted['Model'] != 'ANN'].iloc[0]
-                    
-                    best_model = st.session_state.trained_models[best_classical['Model']]
-                    prediction = best_model.predict(input_scaled)[0]
-                    probability = best_model.predict_proba(input_scaled)[0][1]
-                    
                     st.write(f"**Model:** {best_classical['Model']}")
                     st.write(f"**Prediction:** {'🔴 ASD Positive' if prediction == 1 else '🟢 ASD Negative'}")
                     st.write(f"**Confidence:** {probability*100:.2f}%")
@@ -387,11 +639,126 @@ elif page == "🔮 Make Prediction":
                     st.write(f"**Model:** Artificial Neural Network")
                     st.write(f"**Prediction:** {'🔴 ASD Positive' if ann_pred == 1 else '🟢 ASD Negative'}")
                     st.write(f"**Confidence:** {ann_prob*100:.2f}%")
+                
+                st.markdown("---")
+                st.subheader("💡 Explainable AI (XAI) & Clinical Decision Support")
+                
+                # Model selection dropdown for XAI explanation
+                xai_model_name = st.selectbox(
+                    "Select Model to Explain:",
+                    options=list(st.session_state.trained_models.keys()),
+                    index=0,
+                    key="xai_model_select"
+                )
+                selected_xai_model = st.session_state.trained_models[xai_model_name]
+                selected_prob = selected_xai_model.predict_proba(input_scaled)[0][1]
+                
+                # Render XAI Tabs
+                xai_tab1, xai_tab2, xai_tab3, xai_tab4 = st.tabs([
+                    "🩺 Clinical Narrative", 
+                    "📊 SHAP Feature Attribution", 
+                    "🍋 LIME Explanation", 
+                    "🔄 What-If Simulator"
+                ])
+                
+                with st.spinner("Computing Explainable AI (XAI) attributions..."):
+                    shap_exp, shap_values, base_val = compute_shap_explanation(
+                        selected_xai_model, input_scaled, feature_names,
+                        st.session_state.X_train_scaled, input_values
+                    )
+                
+                with xai_tab1:
+                    if shap_values is not None and base_val is not None:
+                        narrative = generate_clinical_narrative(
+                            feature_names, input_values, shap_values,
+                            base_val, selected_prob, xai_model_name
+                        )
+                        st.markdown(narrative)
+                    else:
+                        st.info("Clinical narrative unavailable due to SHAP computation limitation.")
+                
+                with xai_tab2:
+                    st.write(f"### SHAP Feature Attribution Waterfall ({xai_model_name})")
+                    if shap_exp is not None:
+                        try:
+                            fig_wf = plt.figure(figsize=(9, 5))
+                            shap.plots.waterfall(shap_exp, max_display=10, show=False)
+                            st.pyplot(plt.gcf())
+                            plt.close('all')
+                        except Exception as w_err:
+                            st.warning(f"SHAP Waterfall rendering note: {w_err}")
+                        
+                        st.write("### Feature Contribution Bar Plot")
+                        try:
+                            fig_bar, ax_bar = plt.subplots(figsize=(9, 5))
+                            sorted_indices = np.argsort(np.abs(shap_values))[::-1][:10]
+                            top_features = [feature_names[i] for i in sorted_indices]
+                            top_vals = [shap_values[i] for i in sorted_indices]
+                            colors = ['#e74c3c' if v > 0 else '#2ecc71' for v in top_vals]
+                            ax_bar.barh(top_features[::-1], top_vals[::-1], color=colors[::-1])
+                            ax_bar.set_xlabel("SHAP Value (Impact on Risk Probability)")
+                            ax_bar.set_title(f"Top 10 Feature Contributions ({xai_model_name})")
+                            plt.tight_layout()
+                            st.pyplot(fig_bar)
+                            plt.close('all')
+                        except Exception as b_err:
+                            st.warning(f"SHAP bar plot rendering note: {b_err}")
+                    else:
+                        st.warning("SHAP plot computation encountered an issue.")
+
+                
+                with xai_tab3:
+                    st.write(f"### LIME (Local Interpretable Model-agnostic Explanations) ({xai_model_name})")
+                    lime_exp = compute_lime_explanation(
+                        selected_xai_model, input_scaled, feature_names, st.session_state.X_train_scaled
+                    )
+                    if lime_exp is not None:
+                        fig_lime = lime_exp.as_pyplot_figure()
+                        plt.tight_layout()
+                        st.pyplot(fig_lime)
+                    else:
+                        st.warning("LIME explanation unavailable.")
+                
+                with xai_tab4:
+                    st.write("### 🔄 Interactive What-If Sensitivity Simulator")
+                    st.info("Modify screening scores dynamically to test how individual patient inputs affect predicted ASD risk confidence in real time.")
+                    
+                    target_feat = st.selectbox("Select Feature to Modify:", feature_names, key="whatif_feat")
+                    feat_idx = feature_names.index(target_feat)
+                    
+                    current_val = float(input_values[feat_idx])
+                    min_val = float(df_encoded[target_feat].min())
+                    max_val = float(df_encoded[target_feat].max())
+                    
+                    simulated_val = st.slider(
+                        f"Simulated Value for {target_feat}:",
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=current_val,
+                        step=0.1,
+                        key="whatif_slider"
+                    )
+                    
+                    if simulated_val != current_val:
+                        mod_input = list(input_values)
+                        mod_input[feat_idx] = simulated_val
+                        mod_array = np.array(mod_input).reshape(1, -1).astype(float)
+                        mod_scaled = st.session_state.scaler.transform(mod_array)
+                        
+                        orig_prob = selected_xai_model.predict_proba(input_scaled)[0][1]
+                        sim_prob = selected_xai_model.predict_proba(mod_scaled)[0][1]
+                        diff = sim_prob - orig_prob
+                        
+                        mcol1, mcol2, mcol3 = st.columns(3)
+                        mcol1.metric("Original Confidence", f"{orig_prob*100:.2f}%")
+                        mcol2.metric("Simulated Confidence", f"{sim_prob*100:.2f}%")
+                        mcol3.metric("Probability Shift", f"{diff*100:+.2f}%", delta_color="inverse")
         
         except Exception as e:
             st.error(f"Error during prediction: {str(e)}")
             import traceback
             st.error(f"Details: {traceback.format_exc()}")
+
 
 # ==========================================
 # PAGE 4: MODEL COMPARISON
@@ -407,7 +774,9 @@ elif page == "📊 Model Comparison":
             roc_data = st.session_state.roc_data
             
             # Tabs for different visualizations
-            tab1, tab2, tab3, tab4 = st.tabs(["Performance Metrics", "ROC Curves", "Bar Chart", "Model Ranking"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "Performance Metrics", "ROC Curves", "Bar Chart", "Model Ranking", "💡 Global XAI & Importance"
+            ])
             
             with tab1:
                 st.subheader("Detailed Metrics Table")
@@ -461,6 +830,72 @@ elif page == "📊 Model Comparison":
                     ax.text(v + 0.02, i, f'{v:.4f}', va='center')
                 
                 st.pyplot(fig)
+                
+            with tab5:
+                st.subheader("💡 Global Feature Importance & XAI Analysis")
+                st.markdown("Analyze how features impact model predictions globally across the entire screening dataset.")
+                
+                global_model_name = st.selectbox(
+                    "Select Model for Feature Importance Analysis:",
+                    options=list(st.session_state.trained_models.keys()),
+                    key="global_xai_model_select"
+                )
+                g_model = st.session_state.trained_models[global_model_name]
+                
+                col_g1, col_g2 = st.columns(2)
+                
+                with col_g1:
+                    st.markdown("#### Permutation Feature Importance")
+                    with st.spinner("Calculating permutation importance across test dataset..."):
+                        try:
+                            p_res = permutation_importance(
+                                g_model,
+                                st.session_state.X_test_scaled,
+                                st.session_state.y_test,
+                                n_repeats=5,
+                                random_state=42
+                            )
+                            perm_sorted_idx = p_res.importances_mean.argsort()
+                            
+                            fig_perm, ax_perm = plt.subplots(figsize=(8, 6))
+                            ax_perm.barh(
+                                np.array(st.session_state.feature_names)[perm_sorted_idx],
+                                p_res.importances_mean[perm_sorted_idx],
+                                color='#3498db'
+                            )
+                            ax_perm.set_xlabel("Mean Accuracy Drop when Feature Shuffled")
+                            ax_perm.set_title(f"Permutation Importance ({global_model_name})")
+                            plt.tight_layout()
+                            st.pyplot(fig_perm)
+                        except Exception as pe:
+                            st.warning(f"Could not compute Permutation Importance: {pe}")
+                            
+                with col_g2:
+                    st.markdown("#### Feature Importance Summary")
+                    if hasattr(g_model, "feature_importances_"):
+                        g_importances = g_model.feature_importances_
+                        g_df = pd.DataFrame({
+                            'Feature': st.session_state.feature_names,
+                            'Importance Score': g_importances
+                        }).sort_values(by='Importance Score', ascending=False)
+                        
+                        fig_gimp, ax_gimp = plt.subplots(figsize=(8, 6))
+                        ax_gimp.barh(g_df['Feature'][::-1], g_df['Importance Score'][::-1], color='#9b59b6')
+                        ax_gimp.set_xlabel("Tree / Gini Importance Score")
+                        ax_gimp.set_title(f"Built-in Feature Importance ({global_model_name})")
+                        plt.tight_layout()
+                        st.pyplot(fig_gimp)
+                    else:
+                        if 'p_res' in locals():
+                            g_df = pd.DataFrame({
+                                'Feature': st.session_state.feature_names,
+                                'Importance Mean': p_res.importances_mean,
+                                'Importance Std': p_res.importances_std
+                            }).sort_values(by='Importance Mean', ascending=False)
+                            st.dataframe(g_df, use_container_width=True)
+                        else:
+                            st.info("Feature ranking unavailable.")
+
         
         except Exception as e:
             st.error(f"Error during visualization: {e}")

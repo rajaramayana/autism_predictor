@@ -5,3 +5,7 @@ seaborn>=0.13.2
 scikit-learn>=1.5.0
 imbalanced-learn>=0.12.0
 streamlit>=1.31.0
+shap>=0.44.0
+lime>=0.2.0.1
+streamlit-shap>=1.0.0
+
